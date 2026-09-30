@@ -304,90 +304,47 @@ async def crear_producto(page, prod, idx, total):
         pass
     await page.wait_for_timeout(800)
 
-    # Helper interno: intenta get_by_label primero, luego placeholder, luego índice
-    async def fill_info_field(label_text, placeholders, value, field_idx=None):
-        # 1. get_by_label (maneja floating labels y aria-label)
-        try:
-            el = page.get_by_label(label_text, exact=True)
-            if await el.count() > 0 and await el.first.is_visible(timeout=2000):
-                await el.first.triple_click()
-                await el.first.fill(value)
-                await page.keyboard.press("Tab")
-                log(f"  ✅ {label_text}: via get_by_label")
-                return True
-        except:
-            pass
-        # 2. Placeholder exacto / parcial
-        for ph in placeholders:
-            try:
-                el = page.locator(ph).first
-                if await el.is_visible(timeout=1500):
-                    await el.triple_click()
-                    await el.fill(value)
-                    await page.keyboard.press("Tab")
-                    log(f"  ✅ {label_text}: via placeholder")
-                    return True
-            except:
-                pass
-        # 3. react_set con el primer selector que exista en el DOM
-        for ph in placeholders:
-            try:
-                if await page.locator(ph).count() > 0:
-                    await react_set(page, ph.replace(":visible","").replace(".first",""), value)
-                    log(f"  ✅ {label_text}: via react_set")
-                    return True
-            except:
-                pass
-        # 4. Por índice entre inputs/textareas visibles
-        if field_idx is not None:
-            try:
-                tag = "textarea" if "textarea" in str(placeholders) else "input"
-                els = page.locator(f"{tag}:visible")
-                cnt = await els.count()
-                if cnt > field_idx:
-                    el = els.nth(field_idx)
-                    await el.triple_click()
-                    await el.fill(value)
-                    await page.keyboard.press("Tab")
-                    log(f"  ✅ {label_text}: via índice {field_idx}")
-                    return True
-            except:
-                pass
-        log(f"  ⚠ No encontré campo: {label_text}")
-        return False
+    # Función JS que llena el N-ésimo input/textarea visible con React events
+    async def js_fill_nth(tag, idx, value, label_text):
+        ok = await page.evaluate("""([tag, idx, val]) => {
+            const all = [...document.querySelectorAll(tag)].filter(el => {
+                if (el.type === 'hidden' || el.type === 'file'
+                    || el.type === 'checkbox' || el.type === 'radio') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            });
+            const el = all[idx];
+            if (!el) return false;
+            el.focus();
+            const proto = el.tagName === 'TEXTAREA'
+                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (setter && setter.set) setter.set.call(el, val);
+            else el.value = val;
+            ['input','change','keyup','blur'].forEach(ev => {
+                el.dispatchEvent(new Event(ev, {bubbles: true}));
+            });
+            return true;
+        }""", [tag, idx, value])
+        if ok:
+            log(f"  ✅ {label_text}: via JS[{tag}][{idx}]")
+        else:
+            log(f"  ⚠ No encontré campo: {label_text}")
+        return ok
 
-    # NOMBRE DEL PRODUCTO (primer input visible)
-    await fill_info_field(
-        "Nombre del producto",
-        ['input[placeholder="Nombre del producto"]',
-         'input[placeholder*="ombre del producto"]'],
-        nombre, field_idx=0
-    )
-    await page.wait_for_timeout(300)
+    # NOMBRE DEL PRODUCTO — primer input visible (index 0)
+    await js_fill_nth("input", 0, nombre, "Nombre del producto")
+    await page.wait_for_timeout(400)
 
     # EAN → dejar vacío (opcional)
-
-    # SKU (segundo input visible)
-    await fill_info_field(
-        "SKU",
-        ['input[placeholder="SKU"]',
-         'input[placeholder*="SKU"]',
-         'input[name="sku"]'],
-        sku, field_idx=1
-    )
-    await page.wait_for_timeout(300)
+    # SKU — segundo input visible (index 1)
+    await js_fill_nth("input", 1, sku, "SKU")
+    await page.wait_for_timeout(400)
 
     # Marca del producto → dejar vacío (opcional)
 
-    # DESCRIPCIÓN DEL PRODUCTO
-    # El placeholder real es "Ej: Diadema gamer..." y el label es "Descripción del producto"
-    await fill_info_field(
-        "Descripción del producto",
-        ['textarea[placeholder*="Ej:"]',
-         'textarea[placeholder*="escripci"]',
-         'textarea:visible'],
-        desc, field_idx=0
-    )
+    # DESCRIPCIÓN DEL PRODUCTO — primera textarea visible (index 0)
+    await js_fill_nth("textarea", 0, desc, "Descripción del producto")
     await page.wait_for_timeout(400)
 
     # Continuar → Ficha técnica
