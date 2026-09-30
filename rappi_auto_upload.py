@@ -187,44 +187,81 @@ async def select_dropdown(page, trigger_texts, option_text, label="dropdown"):
     """
     Abre un dropdown (React custom) buscando su trigger por texto visible,
     luego selecciona la opción por texto exacto.
-    trigger_texts: lista de textos que puede mostrar el trigger (placeholder o valor actual)
-    option_text: texto exacto de la opción a seleccionar
     """
-    # Encontrar el elemento trigger usando JS por texto interno
-    trigger_found = await page.evaluate("""([triggers]) => {
-        const candidates = [...document.querySelectorAll(
-            '[class*="select"] [class*="control"], [class*="Select"] [class*="control"], ' +
-            '[role="combobox"], [class*="dropdown"] [class*="trigger"], ' +
-            '[class*="Select__control"], [class*="select__control"]'
-        )];
-        for (const t of triggers) {
-            const el = candidates.find(c => c.textContent.trim().includes(t));
-            if (el) { el.click(); return true; }
-        }
-        // Fallback: buscar cualquier elemento con el texto
-        for (const t of triggers) {
-            const el = [...document.querySelectorAll('*')]
-                .find(e => e.children.length <= 2 && e.textContent.trim() === t
-                      && e.offsetParent !== null);
-            if (el) { el.click(); return true; }
-        }
-        return false;
-    }""", trigger_texts)
+    # Intentar clic en el trigger usando múltiples estrategias
+    trigger_found = False
+
+    # Estrategia 1: clic en texto visible del trigger
+    for text in trigger_texts:
+        for sel in [
+            f':text-is("{text}")',
+            f'text="{text}"',
+            f'[placeholder*="{text}"]',
+        ]:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=1500):
+                    await el.click()
+                    trigger_found = True
+                    break
+            except:
+                pass
+        if trigger_found:
+            break
+
+    # Estrategia 2: JS busca por texto interno en elementos combobox/select
+    if not trigger_found:
+        trigger_found = await page.evaluate("""([triggers]) => {
+            const roles = [...document.querySelectorAll(
+                '[role="combobox"], [role="listbox"], [class*="select"], [class*="Select"],' +
+                '[class*="dropdown"], [class*="Dropdown"]'
+            )];
+            for (const t of triggers) {
+                const el = roles.find(e => e.textContent.trim().includes(t)
+                                     && e.offsetParent !== null);
+                if (el) { el.click(); return true; }
+            }
+            // Buscar cualquier elemento hoja con ese texto exacto
+            for (const t of triggers) {
+                const el = [...document.querySelectorAll('*')].find(
+                    e => e.offsetParent !== null
+                      && e.childElementCount === 0
+                      && e.textContent.trim() === t
+                );
+                if (el) {
+                    // Subir hasta encontrar algo clickeable
+                    let cur = el.parentElement;
+                    for (let i = 0; i < 5; i++) {
+                        if (!cur || cur === document.body) break;
+                        if (cur.getAttribute('role') === 'combobox'
+                            || cur.className.includes('select')
+                            || cur.className.includes('Select')
+                            || cur.className.includes('control')) {
+                            cur.click(); return true;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    el.click(); return true;
+                }
+            }
+            return false;
+        }""", trigger_texts)
 
     if not trigger_found:
         log(f"  ⚠ {label}: no encontré el trigger")
         return False
 
-    await page.wait_for_timeout(700)
+    await page.wait_for_timeout(900)
 
-    # Seleccionar la opción
+    # Seleccionar la opción del menú desplegado
     for opt_sel in [
         f':text-is("{option_text}")',
         f'[role="option"]:has-text("{option_text}")',
         f'li:has-text("{option_text}")',
         f'div[class*="option"]:has-text("{option_text}")',
         f'[class*="Option"]:has-text("{option_text}")',
-        f'[class*="menu-list"] *:has-text("{option_text}")',
+        f'[class*="item"]:has-text("{option_text}")',
+        f'[class*="Item"]:has-text("{option_text}")',
     ]:
         try:
             opt = page.locator(opt_sel).first
@@ -304,47 +341,92 @@ async def crear_producto(page, prod, idx, total):
         pass
     await page.wait_for_timeout(800)
 
-    # Función JS que llena el N-ésimo input/textarea visible con React events
-    async def js_fill_nth(tag, idx, value, label_text):
-        ok = await page.evaluate("""([tag, idx, val]) => {
-            const all = [...document.querySelectorAll(tag)].filter(el => {
-                if (el.type === 'hidden' || el.type === 'file'
-                    || el.type === 'checkbox' || el.type === 'radio') return false;
-                const r = el.getBoundingClientRect();
-                return r.width > 0 && r.height > 0;
-            });
-            const el = all[idx];
-            if (!el) return false;
-            el.focus();
-            const proto = el.tagName === 'TEXTAREA'
-                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const setter = Object.getOwnPropertyDescriptor(proto, 'value');
-            if (setter && setter.set) setter.set.call(el, val);
-            else el.value = val;
-            ['input','change','keyup','blur'].forEach(ev => {
-                el.dispatchEvent(new Event(ev, {bubbles: true}));
-            });
-            return true;
-        }""", [tag, idx, value])
-        if ok:
-            log(f"  ✅ {label_text}: via JS[{tag}][{idx}]")
-        else:
-            log(f"  ⚠ No encontré campo: {label_text}")
-        return ok
+    async def fill_by_click_label(label_texts, value, field_name):
+        """
+        Hace clic en el texto visible del label/placeholder para enfocar el campo,
+        luego llena document.activeElement con el setter de React.
+        Funciona con inputs reales, contenteditable divs, etc.
+        """
+        for text in label_texts:
+            for sel in [
+                f':text-is("{text}")',
+                f'text="{text}"',
+                f'[placeholder="{text}"]',
+                f'[aria-label="{text}"]',
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await el.click()
+                        await page.wait_for_timeout(400)
+                        ok = await page.evaluate("""(val) => {
+                            const el = document.activeElement;
+                            if (!el || el === document.body || el === document.documentElement)
+                                return false;
+                            // React native setter
+                            const tag = el.tagName;
+                            const proto = tag === 'TEXTAREA'
+                                ? HTMLTextAreaElement.prototype
+                                : HTMLInputElement.prototype;
+                            const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (setter && setter.set) setter.set.call(el, val);
+                            else el.textContent = val;  // contenteditable fallback
+                            ['input','change','keyup'].forEach(ev =>
+                                el.dispatchEvent(new Event(ev, {bubbles:true})));
+                            return true;
+                        }""", value)
+                        if ok:
+                            log(f"  ✅ {field_name}: via click+activeElement")
+                            await page.keyboard.press("Tab")
+                            return True
+                except:
+                    pass
 
-    # NOMBRE DEL PRODUCTO — primer input visible (index 0)
-    await js_fill_nth("input", 0, nombre, "Nombre del producto")
+        # Último recurso: Playwright get_by_label (accesibilidad)
+        try:
+            for text in label_texts:
+                el = page.get_by_label(text)
+                if await el.count() > 0:
+                    await el.first.fill(value)
+                    log(f"  ✅ {field_name}: via get_by_label")
+                    return True
+        except:
+            pass
+
+        log(f"  ⚠ No encontré campo: {field_name}")
+        return False
+
+    # NOMBRE DEL PRODUCTO
+    await fill_by_click_label(
+        ["Nombre del producto", "NOMBRE DEL PRODUCTO", "nombre del producto"],
+        nombre, "Nombre del producto"
+    )
     await page.wait_for_timeout(400)
 
     # EAN → dejar vacío (opcional)
-    # SKU — segundo input visible (index 1)
-    await js_fill_nth("input", 1, sku, "SKU")
+
+    # SKU
+    await fill_by_click_label(
+        ["SKU"],
+        sku, "SKU"
+    )
     await page.wait_for_timeout(400)
 
     # Marca del producto → dejar vacío (opcional)
 
-    # DESCRIPCIÓN DEL PRODUCTO — primera textarea visible (index 0)
-    await js_fill_nth("textarea", 0, desc, "Descripción del producto")
+    # DESCRIPCIÓN DEL PRODUCTO
+    # El label dice "DESCRIPCIÓN DEL PRODUCTO" y el placeholder "Ej: ..."
+    await fill_by_click_label(
+        ["DESCRIPCIÓN DEL PRODUCTO", "Descripción del producto",
+         "descripción del producto"],
+        desc, "Descripción del producto"
+    )
+    # Fallback por textarea si el clic en label no funcionó
+    try:
+        if not await page.locator('textarea:visible >> text=' + desc[:20]).count():
+            await react_set(page, "textarea", desc)
+    except:
+        pass
     await page.wait_for_timeout(400)
 
     # Continuar → Ficha técnica
