@@ -295,32 +295,99 @@ async def crear_producto(page, prod, idx, total):
     await page.wait_for_timeout(2500)
 
     # ══ PASO 2a: Completa la información del producto ══════════════════════
-    # Campos: NOMBRE DEL PRODUCTO (req), EAN (opcional), SKU (req),
-    #         Marca del producto (opcional), DESCRIPCIÓN DEL PRODUCTO (req)
+    # Esperar a que el formulario esté listo
+    try:
+        await page.wait_for_selector(
+            'input, textarea', state="visible", timeout=8000
+        )
+    except:
+        pass
+    await page.wait_for_timeout(800)
 
-    await fill_field(page, [
-        'input[placeholder="Nombre del producto"]',
-        'input[placeholder*="ombre"]',
-        'input[aria-label*="ombre"]',
-    ], nombre, "Nombre del producto")
+    # Helper interno: intenta get_by_label primero, luego placeholder, luego índice
+    async def fill_info_field(label_text, placeholders, value, field_idx=None):
+        # 1. get_by_label (maneja floating labels y aria-label)
+        try:
+            el = page.get_by_label(label_text, exact=True)
+            if await el.count() > 0 and await el.first.is_visible(timeout=2000):
+                await el.first.triple_click()
+                await el.first.fill(value)
+                await page.keyboard.press("Tab")
+                log(f"  ✅ {label_text}: via get_by_label")
+                return True
+        except:
+            pass
+        # 2. Placeholder exacto / parcial
+        for ph in placeholders:
+            try:
+                el = page.locator(ph).first
+                if await el.is_visible(timeout=1500):
+                    await el.triple_click()
+                    await el.fill(value)
+                    await page.keyboard.press("Tab")
+                    log(f"  ✅ {label_text}: via placeholder")
+                    return True
+            except:
+                pass
+        # 3. react_set con el primer selector que exista en el DOM
+        for ph in placeholders:
+            try:
+                if await page.locator(ph).count() > 0:
+                    await react_set(page, ph.replace(":visible","").replace(".first",""), value)
+                    log(f"  ✅ {label_text}: via react_set")
+                    return True
+            except:
+                pass
+        # 4. Por índice entre inputs/textareas visibles
+        if field_idx is not None:
+            try:
+                tag = "textarea" if "textarea" in str(placeholders) else "input"
+                els = page.locator(f"{tag}:visible")
+                cnt = await els.count()
+                if cnt > field_idx:
+                    el = els.nth(field_idx)
+                    await el.triple_click()
+                    await el.fill(value)
+                    await page.keyboard.press("Tab")
+                    log(f"  ✅ {label_text}: via índice {field_idx}")
+                    return True
+            except:
+                pass
+        log(f"  ⚠ No encontré campo: {label_text}")
+        return False
+
+    # NOMBRE DEL PRODUCTO (primer input visible)
+    await fill_info_field(
+        "Nombre del producto",
+        ['input[placeholder="Nombre del producto"]',
+         'input[placeholder*="ombre del producto"]'],
+        nombre, field_idx=0
+    )
     await page.wait_for_timeout(300)
 
-    # EAN y Marca → dejar vacíos (son opcionales)
+    # EAN → dejar vacío (opcional)
 
-    await fill_field(page, [
-        'input[placeholder="SKU"]',
-        'input[placeholder*="SKU"]',
-        'input[aria-label*="SKU"]',
-        'input[name="sku"]',
-    ], sku, "SKU")
+    # SKU (segundo input visible)
+    await fill_info_field(
+        "SKU",
+        ['input[placeholder="SKU"]',
+         'input[placeholder*="SKU"]',
+         'input[name="sku"]'],
+        sku, field_idx=1
+    )
     await page.wait_for_timeout(300)
 
-    await fill_field(page, [
-        'textarea[placeholder*="escripción"]',
-        'textarea[placeholder*="Descripción"]',
-        'textarea[aria-label*="escripción"]',
-        'textarea:visible',
-    ], desc, "Descripción del producto")
+    # Marca del producto → dejar vacío (opcional)
+
+    # DESCRIPCIÓN DEL PRODUCTO
+    # El placeholder real es "Ej: Diadema gamer..." y el label es "Descripción del producto"
+    await fill_info_field(
+        "Descripción del producto",
+        ['textarea[placeholder*="Ej:"]',
+         'textarea[placeholder*="escripci"]',
+         'textarea:visible'],
+        desc, field_idx=0
+    )
     await page.wait_for_timeout(400)
 
     # Continuar → Ficha técnica
