@@ -183,6 +183,63 @@ async def next_step(page):
             pass
     return False
 
+async def select_dropdown(page, trigger_texts, option_text, label="dropdown"):
+    """
+    Abre un dropdown (React custom) buscando su trigger por texto visible,
+    luego selecciona la opción por texto exacto.
+    trigger_texts: lista de textos que puede mostrar el trigger (placeholder o valor actual)
+    option_text: texto exacto de la opción a seleccionar
+    """
+    # Encontrar el elemento trigger usando JS por texto interno
+    trigger_found = await page.evaluate("""([triggers]) => {
+        const candidates = [...document.querySelectorAll(
+            '[class*="select"] [class*="control"], [class*="Select"] [class*="control"], ' +
+            '[role="combobox"], [class*="dropdown"] [class*="trigger"], ' +
+            '[class*="Select__control"], [class*="select__control"]'
+        )];
+        for (const t of triggers) {
+            const el = candidates.find(c => c.textContent.trim().includes(t));
+            if (el) { el.click(); return true; }
+        }
+        // Fallback: buscar cualquier elemento con el texto
+        for (const t of triggers) {
+            const el = [...document.querySelectorAll('*')]
+                .find(e => e.children.length <= 2 && e.textContent.trim() === t
+                      && e.offsetParent !== null);
+            if (el) { el.click(); return true; }
+        }
+        return false;
+    }""", trigger_texts)
+
+    if not trigger_found:
+        log(f"  ⚠ {label}: no encontré el trigger")
+        return False
+
+    await page.wait_for_timeout(700)
+
+    # Seleccionar la opción
+    for opt_sel in [
+        f':text-is("{option_text}")',
+        f'[role="option"]:has-text("{option_text}")',
+        f'li:has-text("{option_text}")',
+        f'div[class*="option"]:has-text("{option_text}")',
+        f'[class*="Option"]:has-text("{option_text}")',
+        f'[class*="menu-list"] *:has-text("{option_text}")',
+    ]:
+        try:
+            opt = page.locator(opt_sel).first
+            if await opt.is_visible(timeout=1500):
+                await opt.click()
+                log(f"  ✅ {label}: '{option_text}' seleccionado")
+                return True
+        except:
+            pass
+
+    log(f"  ⚠ {label}: menú abierto pero no encontré '{option_text}'")
+    await page.keyboard.press("Escape")
+    return False
+
+
 async def crear_producto(page, prod, idx, total):
     sku    = prod["sku"]
     nombre = prod["nombre"]
@@ -190,7 +247,7 @@ async def crear_producto(page, prod, idx, total):
     desc   = prod["desc"]
     cat    = prod["cat"]   # [L1, L2, L3]
 
-    # Imágenes del producto
+    # Imágenes del producto (carpeta IMAGES_BASE/sku/)
     carpeta = IMAGES_BASE / sku
     imgs = []
     if carpeta.exists():
@@ -199,262 +256,225 @@ async def crear_producto(page, prod, idx, total):
         rest += sorted(carpeta.glob(f"{sku}*.png"))
         imgs = (wb + rest)[:4]
 
-    log(f"[{idx}/{total}] ▶ {sku}  precio=${precio}  imgs={len(imgs)}")
+    log(f"\n[{idx}/{total}] ▶ {sku}  precio=${precio}  imgs={len(imgs)}")
 
-    # ── Ir directo al formulario "Desde cero" ──────────────────────────────
+    # ══ PASO 1: Página de categorías ═══════════════════════════════════════
     await page.goto(RAPPI_STEPS, wait_until="networkidle", timeout=30000)
     await page.wait_for_timeout(2000)
 
-    # ── PASO A: seleccionar categorías por chips ────────────────────────────
+    # Verificar que llegamos a la página correcta
+    if "login" in page.url or "auth" in page.url:
+        log("  ⚠ Sesión expirada — esperando login manual (60s)...")
+        try:
+            await page.wait_for_url("**/cms/**", timeout=60000)
+            await page.goto(RAPPI_STEPS, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(2000)
+        except:
+            log("  ✗ No se pudo restablecer sesión")
+            return False
+
     # L1 — categoría principal
-    ok_l1 = await click_chip(page, cat[0])
-    if not ok_l1:
+    if not await click_chip(page, cat[0]):
         log(f"  ⚠ No encontré categoría L1: {cat[0]}")
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(1200)
 
-    # L2 — subcategoría 1 (aparece tras seleccionar L1)
+    # L2 — subcategoría 1
     if len(cat) > 1:
-        ok_l2 = await click_chip(page, cat[1])
-        if not ok_l2:
+        if not await click_chip(page, cat[1]):
             log(f"  ⚠ No encontré subcategoría L2: {cat[1]}")
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1200)
 
-    # L3 — subcategoría 2 (aparece tras seleccionar L2)
+    # L3 — subcategoría 2
     if len(cat) > 2:
-        ok_l3 = await click_chip(page, cat[2])
-        if not ok_l3:
+        if not await click_chip(page, cat[2]):
             log(f"  ⚠ No encontré subcategoría L3: {cat[2]}")
         await page.wait_for_timeout(800)
 
-    # Avanzar al siguiente paso (nombre/precio/descripción)
+    # Continuar → Info básica
     await next_step(page)
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(2500)
 
-    # ── PASO B: Sección 1 — Nombre, SKU, Descripción ───────────────────────
+    # ══ PASO 2a: Completa la información del producto ══════════════════════
+    # Campos: NOMBRE DEL PRODUCTO (req), EAN (opcional), SKU (req),
+    #         Marca del producto (opcional), DESCRIPCIÓN DEL PRODUCTO (req)
+
     await fill_field(page, [
         'input[placeholder="Nombre del producto"]',
-        'input[placeholder*="ombre del producto"]',
-        'input[placeholder*="Nombre"]',
-    ], nombre, "nombre")
+        'input[placeholder*="ombre"]',
+        'input[aria-label*="ombre"]',
+    ], nombre, "Nombre del producto")
     await page.wait_for_timeout(300)
+
+    # EAN y Marca → dejar vacíos (son opcionales)
 
     await fill_field(page, [
         'input[placeholder="SKU"]',
         'input[placeholder*="SKU"]',
+        'input[aria-label*="SKU"]',
         'input[name="sku"]',
-        'input[id*="sku"]',
     ], sku, "SKU")
     await page.wait_for_timeout(300)
 
     await fill_field(page, [
-        'textarea[placeholder="Descripción del producto"]',
-        'textarea[placeholder*="escripción del producto"]',
-        'textarea[placeholder*="Ej:"]',
+        'textarea[placeholder*="escripción"]',
+        'textarea[placeholder*="Descripción"]',
+        'textarea[aria-label*="escripción"]',
         'textarea:visible',
-    ], desc, "descripción")
-    await page.wait_for_timeout(300)
+    ], desc, "Descripción del producto")
+    await page.wait_for_timeout(400)
 
     # Continuar → Ficha técnica
     await next_step(page)
     await page.wait_for_timeout(2500)
 
-    # ── PASO C: Ficha técnica — OBLIGATORIO: Cantidad=1, Unidad=UND ──────────
-    await page.wait_for_timeout(1500)
+    # ══ PASO 2b: Ficha técnica ═════════════════════════════════════════════
+    # Tres campos OBLIGATORIOS:
+    #   1. "Formato de venta" dropdown → "Unidad"
+    #   2. "CANTIDAD" input            → "1"
+    #   3. "UNIDAD DE VENTA" dropdown  → "Und"
 
-    # Cantidad: campo numérico (generalmente un input type=number o text)
-    cantidad_ok = await fill_field(page, [
-        'input[placeholder*="antidad"]',
+    # 1. Formato de venta → Unidad
+    await select_dropdown(page,
+        ["Formato de venta", "Seleccionar"],
+        "Unidad",
+        "Formato de venta"
+    )
+    await page.wait_for_timeout(600)
+
+    # 2. Cantidad → 1
+    await fill_field(page, [
         'input[placeholder="Cantidad"]',
+        'input[placeholder*="antidad"]',
+        'input[aria-label*="antidad"]',
         'input[name*="antidad"]',
         'input[name*="quantity"]',
-        'input[aria-label*="antidad"]',
     ], "1", "Cantidad")
+    await page.wait_for_timeout(400)
 
-    if not cantidad_ok:
-        # Intentar con el primer input numérico visible de la ficha técnica
-        try:
-            num_inputs = page.locator('input[type="number"]:visible, input[type="text"]:visible')
-            cnt = await num_inputs.count()
-            if cnt > 0:
-                el = num_inputs.first
-                await el.triple_click()
-                await el.fill("1")
-                await page.keyboard.press("Tab")
-                cantidad_ok = True
-                log("  Cantidad: llenado con primer input numérico")
-        except Exception as e:
-            log(f"  ⚠ Cantidad: {e}")
+    # 3. Unidad de venta → Und
+    await select_dropdown(page,
+        ["UNIDAD DE VENTA", "Seleccionar", "Unidad de venta"],
+        "Und",
+        "Unidad de venta"
+    )
+    await page.wait_for_timeout(600)
 
-    await page.wait_for_timeout(500)
-
-    # Unidad: dropdown/combobox → seleccionar "UND"
-    unidad_ok = False
-    # Estrategia 1: combobox con aria-label o placeholder Unidad
-    for dd_sel in [
-        '[aria-label*="nidad"]',
-        '[placeholder*="nidad"]',
-        '[role="combobox"]:visible',
-        'select:visible',
-    ]:
-        try:
-            el = page.locator(dd_sel).first
-            if await el.is_visible(timeout=2000):
-                tag = await el.evaluate("el => el.tagName.toLowerCase()")
-                if tag == "select":
-                    await el.select_option(label="UND")
-                else:
-                    await el.click()
-                    await page.wait_for_timeout(700)
-                    # Buscar opción "UND" en el menú desplegado
-                    for opt_sel in [
-                        ':text-is("UND")',
-                        '[role="option"]:has-text("UND")',
-                        'li:has-text("UND")',
-                        'div[role="option"]:has-text("UND")',
-                    ]:
-                        try:
-                            opt = page.locator(opt_sel).first
-                            if await opt.is_visible(timeout=1500):
-                                await opt.click()
-                                unidad_ok = True
-                                break
-                        except:
-                            pass
-                    if not unidad_ok:
-                        # Intentar con keyboard: teclear "UND"
-                        await page.keyboard.type("UND")
-                        await page.wait_for_timeout(500)
-                        for opt_sel in [
-                            ':text-is("UND")',
-                            '[role="option"]:has-text("UND")',
-                            'li:has-text("UND")',
-                        ]:
-                            try:
-                                opt = page.locator(opt_sel).first
-                                if await opt.is_visible(timeout=1500):
-                                    await opt.click()
-                                    unidad_ok = True
-                                    break
-                            except:
-                                pass
-                if unidad_ok:
-                    break
-        except:
-            pass
-
-    if cantidad_ok:
-        log("  ✅ Ficha técnica: Cantidad=1")
-    if unidad_ok:
-        log("  ✅ Ficha técnica: Unidad=UND")
-    if not cantidad_ok or not unidad_ok:
-        log(f"  ⚠ Ficha técnica incompleta (cantidad={cantidad_ok}, unidad={unidad_ok})")
-
-    await page.wait_for_timeout(800)
     # Continuar → Imágenes
     await next_step(page)
     await page.wait_for_timeout(2500)
 
-    # ── PASO D: Imágenes — una por una ──────────────────────────────────────
+    # ══ PASO 2c: Imágenes del producto ════════════════════════════════════
+    # UI: 1 slot principal + 3 slots "Imagen adicional (opcional)" con botón "+"
+    # Subimos hasta 4 imágenes; los slots adicionales requieren clic en "+"
+
     if imgs:
         for i, img_path in enumerate(imgs):
-            # Cada imagen puede tener su propio input o un botón "+"
             try:
-                # Buscar el i-ésimo input de archivo disponible
+                # Contar inputs de archivo disponibles AHORA
                 file_inputs = page.locator('input[type="file"]')
                 fi_cnt = await file_inputs.count()
+
                 if i < fi_cnt:
+                    # Input ya visible (slot 0 o slots previamente abiertos)
                     await file_inputs.nth(i).set_input_files(str(img_path))
                     await page.wait_for_timeout(3000)
-                    log(f"  📷 Imagen {i+1}/{len(imgs)}: {img_path.name}")
+                    log(f"  📷 [{i+1}/{len(imgs)}] {img_path.name}")
                 else:
-                    # Buscar botón "+" para agregar más imágenes
-                    add_btn = await click_visible(page, [
-                        'button:has-text("+")',
-                        '[aria-label*="agregar"]',
-                        '[aria-label*="Agregar"]',
-                        '[class*="add"]:visible',
-                        'button[class*="upload"]:visible',
-                    ], timeout=2000)
-                    if add_btn:
+                    # Necesitamos abrir un nuevo slot haciendo clic en "+"
+                    # Los "+" son botones dentro de los slots "adicional"
+                    plus_btns = page.locator(
+                        'button:has-text("+"), [aria-label*="gregar"], [class*="add-image"], [class*="addImage"]'
+                    )
+                    pb_cnt = await plus_btns.count()
+                    if pb_cnt > 0:
+                        await plus_btns.first.click()
                         await page.wait_for_timeout(800)
+                        # Ahora debe haber un nuevo input de archivo
                         fi_cnt2 = await file_inputs.count()
                         if fi_cnt2 > i:
                             await file_inputs.nth(i).set_input_files(str(img_path))
                             await page.wait_for_timeout(3000)
-                            log(f"  📷 Imagen {i+1}/{len(imgs)}: {img_path.name}")
+                            log(f"  📷 [{i+1}/{len(imgs)}] {img_path.name}")
+                        else:
+                            log(f"  ⚠ Imagen {i+1}: no apareció nuevo input tras clic en +")
+                    else:
+                        log(f"  ⚠ Imagen {i+1}: no hay más slots disponibles")
             except Exception as e:
-                log(f"  ⚠ Error subiendo imagen {i+1}: {e}")
+                log(f"  ⚠ Error imagen {i+1}: {e}")
+    else:
+        log(f"  ⚠ Sin imágenes para {sku} (carpeta: {carpeta})")
 
-    # Continuar → Selección de bodega / precio
+    # Continuar → Paso 3: Asocia (bodega + precio)
     await next_step(page)
     await page.wait_for_timeout(2500)
 
-    # ── PASO E: Seleccionar "Bodega Ofertix" ────────────────────────────────
+    # ══ PASO 3: Asocia — Bodega Ofertix + Precio ══════════════════════════
+    # Clic en la tarjeta/botón de "Bodega Ofertix" o "OFERTIX"
     bodega_ok = await click_visible(page, [
         'button:has-text("Ofertix")',
         'button:has-text("OFERTIX")',
-        'div:has-text("Ofertix") >> button',
+        '[class*="store"]:has-text("Ofertix")',
         '[class*="bodega"]:has-text("Ofertix")',
-        ':text("Ofertix")',
-        'text=Ofertix',
     ], timeout=5000)
+
     if not bodega_ok:
-        # Intentar con JS como hicimos con "Desde cero"
         bodega_ok = await page.evaluate("""() => {
-            const heading = [...document.querySelectorAll('*')]
-                .find(el => el.children.length === 0
-                         && el.textContent.includes('Ofertix'));
-            if (heading) {
-                let el = heading.parentElement;
-                for (let i = 0; i < 6; i++) {
-                    if (!el || el === document.body) break;
-                    const btn = el.querySelector('button');
-                    if (btn) { btn.click(); return true; }
-                    el = el.parentElement;
+            const all = [...document.querySelectorAll('*')];
+            const el = all.find(e => e.offsetParent !== null
+                                  && e.children.length <= 3
+                                  && e.textContent.includes('Ofertix'));
+            if (!el) return false;
+            // Subir hasta encontrar elemento clickeable
+            let cur = el;
+            for (let i = 0; i < 8; i++) {
+                if (!cur || cur === document.body) break;
+                if (cur.tagName === 'BUTTON' || cur.getAttribute('role') === 'button'
+                    || cur.onclick || cur.style.cursor === 'pointer') {
+                    cur.click(); return true;
                 }
+                cur = cur.parentElement;
             }
-            return false;
+            // Si no encontramos button padre, clic directo en el texto
+            el.click(); return true;
         }""")
+
     if bodega_ok:
         log("  🏪 Bodega Ofertix seleccionada")
     else:
-        log("  ⚠ No encontré 'Bodega Ofertix' — intentando continuar de todas formas")
-    await page.wait_for_timeout(1500)
+        log("  ⚠ No encontré 'Bodega Ofertix' — continuando de todas formas")
+    await page.wait_for_timeout(1000)
 
-    # ── PASO F: Precio ──────────────────────────────────────────────────────
-    await fill_field(page, [
-        'input[placeholder*="Precio"]',
+    # Precio
+    precio_ok = await fill_field(page, [
         'input[placeholder*="recio"]',
+        'input[placeholder*="Precio"]',
         'input[placeholder*="$ "]',
         'input[type="number"]:visible',
-        'input[name="price"]',
-        'input[name="precio"]',
-    ], precio, "precio")
+        'input[name*="price"]',
+        'input[name*="precio"]',
+    ], precio, "Precio")
     await page.wait_for_timeout(400)
 
-    # Continuar → guardar/publicar
-    await next_step(page)
-    await page.wait_for_timeout(3000)
-
-    # ── PASO G: confirmar guardado ──────────────────────────────────────────
-    # El producto ya debería estar creado tras el último "Continuar".
-    # Si hay botón de confirmación adicional, clicamos.
-    await click_visible(page, [
+    # Botón final: "Asociar" (último paso del wizard)
+    asociar_ok = await click_visible(page, [
+        'button:has-text("Asociar")',
         'button:has-text("Guardar")',
-        'button:has-text("Crear producto")',
         'button:has-text("Publicar")',
         'button:has-text("Finalizar")',
-    ], timeout=3000)
-    await page.wait_for_timeout(2000)
+        'button:has-text("Crear")',
+    ], timeout=5000)
 
-    # Verificar que salimos del formulario (URL cambia o aparece confirmación)
-    cur_url = page.url
-    if "steps" not in cur_url or "product-list" in cur_url:
-        log(f"  ✅ {sku} creado exitosamente")
+    await page.wait_for_timeout(3000)
+
+    if asociar_ok:
+        log(f"  ✅ {sku} creado y asociado")
         return True
     else:
-        await page.screenshot(path=str(IMAGES_BASE / f"err_{sku}_guardar.png"))
-        log(f"  ✗ {sku}: formulario sigue abierto tras Continuar — ver screenshot")
+        try:
+            await page.screenshot(path=str(IMAGES_BASE / f"err_{sku}.png"))
+        except:
+            pass
+        log(f"  ✗ {sku}: no encontré botón Asociar — ver screenshot")
         return False
 
 # ── Main ───────────────────────────────────────────────────────────────────────
